@@ -1,5 +1,10 @@
 # Parameter Golf — Baseline Architecture & Records Analysis
 
+## To run
+```bash
+  RUN_ID=test ITERATIONS=200 TRAIN_BATCH_TOKENS=8192 VAL_LOSS_EVERY=0 VAL_BATCH_SIZE=8192 TTT_BATCH_SIZE=32 PYTORCH_ALLOC_CONF=expandable_segments:True python3 train_gpt.py
+```
+
 ## Baseline Architecture (`train_gpt.py`)
 
 ### Overview
