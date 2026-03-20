@@ -31,7 +31,12 @@ image = (
         "sentencepiece",
     )
     # Copy the full repo into the image so train_gpt.py and data scripts are available.
-    .add_local_dir(".", remote_path="/workspace/parameter-golf", ignore=[".venv", ".git", "logs", "*.pt", "*.ptz"])
+    .add_local_dir(
+        ".",
+        remote_path="/workspace/parameter-golf",
+        ignore=[".venv", ".git", "logs", "*.pt", "*.ptz"],
+        copy=True,
+    )
     # Download the dataset at build time so it's cached in the image layer.
     .run_commands(
         "cd /workspace/parameter-golf && python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10"
@@ -57,14 +62,36 @@ ENV_DEFAULTS = {
 
 # Let the caller override any hyperparameter via local env vars.
 FORWARDED_ENVS = [
-    "RUN_ID", "SEED", "ITERATIONS", "WARMDOWN_ITERS", "WARMUP_STEPS",
-    "TRAIN_BATCH_TOKENS", "TRAIN_SEQ_LEN", "MAX_WALLCLOCK_SECONDS",
-    "VOCAB_SIZE", "NUM_LAYERS", "NUM_KV_HEADS", "MODEL_DIM", "NUM_HEADS",
-    "MLP_MULT", "TIE_EMBEDDINGS", "ROPE_BASE", "LOGIT_SOFTCAP",
-    "EMBED_LR", "HEAD_LR", "TIED_EMBED_LR", "TIED_EMBED_INIT_STD",
-    "MATRIX_LR", "SCALAR_LR", "MUON_MOMENTUM", "MUON_BACKEND_STEPS",
-    "VAL_BATCH_SIZE", "VAL_LOSS_EVERY", "TRAIN_LOG_EVERY",
-    "QK_GAIN_INIT", "GRAD_CLIP_NORM",
+    "RUN_ID",
+    "SEED",
+    "ITERATIONS",
+    "WARMDOWN_ITERS",
+    "WARMUP_STEPS",
+    "TRAIN_BATCH_TOKENS",
+    "TRAIN_SEQ_LEN",
+    "MAX_WALLCLOCK_SECONDS",
+    "VOCAB_SIZE",
+    "NUM_LAYERS",
+    "NUM_KV_HEADS",
+    "MODEL_DIM",
+    "NUM_HEADS",
+    "MLP_MULT",
+    "TIE_EMBEDDINGS",
+    "ROPE_BASE",
+    "LOGIT_SOFTCAP",
+    "EMBED_LR",
+    "HEAD_LR",
+    "TIED_EMBED_LR",
+    "TIED_EMBED_INIT_STD",
+    "MATRIX_LR",
+    "SCALAR_LR",
+    "MUON_MOMENTUM",
+    "MUON_BACKEND_STEPS",
+    "VAL_BATCH_SIZE",
+    "VAL_LOSS_EVERY",
+    "TRAIN_LOG_EVERY",
+    "QK_GAIN_INIT",
+    "GRAD_CLIP_NORM",
 ]
 
 
@@ -79,8 +106,8 @@ def _build_env() -> dict[str, str]:
 
 @app.function(
     image=image,
-    gpu="T4",
-    timeout=1800,
+    gpu="L4",
+    timeout=3600,
     volumes={"/outputs": output_vol},
 )
 def train():
@@ -90,7 +117,9 @@ def train():
 
     result = subprocess.run(
         [
-            "torchrun", "--standalone", "--nproc_per_node=1",
+            "torchrun",
+            "--standalone",
+            "--nproc_per_node=1",
             "train_gpt.py",
         ],
         cwd="/workspace/parameter-golf",
@@ -99,6 +128,7 @@ def train():
 
     # Copy artifacts to the persistent volume.
     import shutil
+
     for name in ("final_model.pt", "final_model.int8.ptz"):
         src = f"/workspace/parameter-golf/{name}"
         if os.path.exists(src):
