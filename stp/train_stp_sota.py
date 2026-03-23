@@ -23,7 +23,6 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
 from stp_loss import compute_stp_loss
 class Hyperparameters:
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -529,7 +528,15 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        # [B, T, H, D] -> [B, H, T, D] for PyTorch SDPA
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v_sdpa = v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(
+            q, k, v_sdpa, attn_mask=None, is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )
+        y = y.transpose(1, 2)  # [B, H, T, D] -> [B, T, H, D]
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
