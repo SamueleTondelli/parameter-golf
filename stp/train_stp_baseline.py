@@ -1021,6 +1021,7 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
+        train_ntp_loss = torch.zeros((), device=device)
         train_stp_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
@@ -1031,12 +1032,15 @@ def main() -> None:
                     ntp_loss, hidden = model(x, y, return_hidden=True)
                     stp_loss = compute_stp_loss(hidden)
                     loss = ntp_loss + args.stp_lambda * stp_loss
+                    train_ntp_loss += ntp_loss.detach()
                     train_stp_loss += stp_loss.detach()
                 else:
                     loss = model(x, y)
+                    train_ntp_loss += loss.detach()
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+        train_ntp_loss /= grad_accum_steps
         train_stp_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1139,6 +1143,17 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if master_process:
+        import csv
+        results_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stp_results.csv")
+        write_header = not os.path.exists(results_path)
+        with open(results_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["run_id", "stp_lambda", "train_ntp_loss", "final_val_bpb"])
+            writer.writerow([args.run_id, args.stp_lambda, f"{train_ntp_loss.item():.6f}", f"{q_val_bpb:.8f}"])
+        log0(f"results appended to {results_path}")
 
     if distributed:
         dist.destroy_process_group()
