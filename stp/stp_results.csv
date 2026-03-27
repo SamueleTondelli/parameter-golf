@@ -1,0 +1,13 @@
+run_id,stp_lambda,train_ntp_loss,final_val_bpb
+stp_base_big_0,0.0,2.668551,1.63329629
+stp_base_small_0,0.0,3.231058,1.91002566
+stp_base_big_02,0.02,2.703900,1.65511818
+stp_base_small_02,0.02,3.247830,1.91061156
+stp_base_big_06,0.06,2.731725,1.66912020
+stp_base_small_06,0.06,3.278773,1.93164791
+stp_sota_big_0,0.0,3.066449,6.65689082
+stp_sota_small_0,0.0,3.505528,6.02617789
+stp_sota_big_02,0.02,3.503762,3.98205336
+stp_sota_small_02,0.02,3.797846,3.38712265
+stp_sota_big_06,0.06,3.510258,3.91561131
+stp_sota_small_06,0.06,3.809020,3.41283890
