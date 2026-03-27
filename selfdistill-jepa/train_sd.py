@@ -92,6 +92,8 @@ class Hyperparameters:
     teacher_ema_decay = float(
         os.environ.get("TEACHER_EMA_DECAY", 0.996)
     )  # DINOv1 default start
+    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.05))
+    sigreg_projections = int(os.environ.get("SIGREG_PROJECTIONS", 256))
 
 
 # -----------------------------
@@ -665,8 +667,73 @@ class LMHead(nn.Module):
 # -----------------------------
 
 
+@torch.no_grad()
+def update_ema(student_model, teacher_model, decay=0.999):
+    for student_param, teacher_param in zip(
+        student_model.parameters(), teacher_model.parameters()
+    ):
+        teacher_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
+
+
+distributed = False
+
+
+def sigreg_loss(
+    x: torch.Tensor,
+    global_step: int,
+    num_projections: int = 256,
+    integration_points: int = 17,
+    integration_domain: tuple[float, float] = (-5.0, 5.0),
+):
+    global distributed
+
+    if x.ndim != 2:
+        raise ValueError(f"sigreg_loss expects (batch, dim), got {tuple(x.shape)}")
+
+    x = x.float()
+
+    generator = torch.Generator(device=x.device)
+    generator.manual_seed(global_step)
+
+    proj_shape = (x.size(-1), num_projections)
+    rand_projections = torch.randn(
+        proj_shape, generator=generator, device=x.device, dtype=x.dtype
+    )
+    rand_projections /= torch.norm(
+        rand_projections, p=2, dim=0, keepdim=True
+    ).clamp_min(1e-12)
+
+    projections = x @ rand_projections  # (batch, num_projections)
+
+    t = torch.linspace(
+        integration_domain[0],
+        integration_domain[1],
+        integration_points,
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    theoretical_cf = torch.exp(-0.5 * t.pow(2))
+
+    projected_t = projections.unsqueeze(-1) * t  # (batch, num_projections, num_t)
+
+    empirical_cf_real = torch.cos(projected_t).mean(dim=0)
+    empirical_cf_imag = torch.sin(projected_t).mean(dim=0)
+
+    if distributed:
+        dist.all_reduce(empirical_cf_real, op=dist.ReduceOp.AVG)
+        dist.all_reduce(empirical_cf_imag, op=dist.ReduceOp.AVG)
+
+    err = (
+        (empirical_cf_real - theoretical_cf).pow(2) + empirical_cf_imag.pow(2)
+    ) * theoretical_cf
+
+    ep_statistic = torch.trapezoid(err, t, dim=1)
+    return ep_statistic.mean()
+
+
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, distributed
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
@@ -981,13 +1048,6 @@ def main() -> None:
     # ENCODER TRAINING LOOP
     # -----------------------------
 
-    @torch.no_grad()
-    def update_ema(student_model, teacher_model, decay=0.999):
-        for student_param, teacher_param in zip(
-            student_model.parameters(), teacher_model.parameters()
-        ):
-            teacher_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
-
     log0("--- encoder training ---")
     training_time_ms = 0.0
     stop_after_step: int | None = None
@@ -1024,7 +1084,14 @@ def main() -> None:
                 student_embeddings = encoder(x)
                 with torch.no_grad():
                     teacher_embeddings = teacher_encoder(y)
-                loss = F.mse_loss(student_embeddings, teacher_embeddings)
+                pred_loss = F.mse_loss(student_embeddings, teacher_embeddings)
+            with torch.autocast(device_type="cuda", enabled=False):
+                reg_loss = sigreg_loss(
+                    student_embeddings[:, -1, :].float(),
+                    step,
+                    num_projections=args.sigreg_projections,
+                )
+            loss = (1 - args.sigreg_lambda) * pred_loss + args.sigreg_lambda * reg_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
             update_ema(base_encoder, base_teacher_encoder, decay=args.teacher_ema_decay)
