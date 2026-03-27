@@ -951,9 +951,10 @@ def main() -> None:
                 with torch.autocast(
                     device_type="cuda", dtype=torch.bfloat16, enabled=True
                 ):
-                    embeddings = encoder(x)
-                    # TODO: replace with actual encoder loss
-                    warmup_loss = embeddings.sum() * 0.0
+                    student_embeddings = encoder(x)
+                    with torch.no_grad():
+                        teacher_embeddings = teacher_encoder(y)
+                    warmup_loss = F.mse_loss(student_embeddings, teacher_embeddings)
                 (warmup_loss * grad_scale).backward()
             for opt in enc_optimizers:
                 opt.step()
@@ -1020,9 +1021,10 @@ def main() -> None:
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                embeddings = encoder(x)
-                teacher_embeddings = teacher_encoder(x)
-                loss = F.mse_loss(embeddings, teacher_embeddings)
+                student_embeddings = encoder(x)
+                with torch.no_grad():
+                    teacher_embeddings = teacher_encoder(y)
+                loss = F.mse_loss(student_embeddings, teacher_embeddings)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
             update_ema(base_encoder, base_teacher_encoder, decay=args.teacher_ema_decay)
