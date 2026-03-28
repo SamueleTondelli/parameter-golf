@@ -92,7 +92,7 @@ class Hyperparameters:
     teacher_ema_decay = float(
         os.environ.get("TEACHER_EMA_DECAY", 0.996)
     )  # DINOv1 default start
-    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.05))
+    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.1))
     sigreg_projections = int(os.environ.get("SIGREG_PROJECTIONS", 256))
 
 
@@ -1094,7 +1094,6 @@ def main() -> None:
             loss = (1 - args.sigreg_lambda) * pred_loss + args.sigreg_lambda * reg_loss
             train_loss += loss.detach()
             (loss * grad_scale).backward()
-            update_ema(base_encoder, base_teacher_encoder, decay=args.teacher_ema_decay)
         train_loss /= grad_accum_steps
 
         frac = (
@@ -1118,6 +1117,7 @@ def main() -> None:
             )
         for opt in enc_optimizers:
             opt.step()
+        update_ema(base_encoder, base_teacher_encoder, decay=args.teacher_ema_decay)
         zero_grad_enc()
 
         step += 1
