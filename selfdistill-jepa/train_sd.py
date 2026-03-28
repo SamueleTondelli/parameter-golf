@@ -953,13 +953,13 @@ def main() -> None:
         .bfloat16()
     )
 
-    for module in base_encoder.modules():
+    for module in base_teacher_encoder.modules():
         if isinstance(module, CastedLinear):
             module.float()
-    restore_low_dim_params_to_fp32(base_encoder)
+    restore_low_dim_params_to_fp32(base_teacher_encoder)
     base_teacher_encoder.requires_grad_(False)
     base_teacher_encoder.load_state_dict(base_encoder.state_dict())
-    teacher_encoder = torch.compile(base_encoder, dynamic=False, fullgraph=True)
+    teacher_encoder = torch.compile(base_teacher_encoder, dynamic=False, fullgraph=True)
 
     # -----------------------------
     # DATA LOADER & ENCODER WARMUP
