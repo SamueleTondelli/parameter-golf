@@ -90,13 +90,13 @@ class Hyperparameters:
 
     # Teacher hyperparameters
     teacher_ema_decay = float(
-        os.environ.get("TEACHER_EMA_DECAY", 0.99)
+        os.environ.get("TEACHER_EMA_DECAY", 0.999)
     )  # start value, scheduled toward ema_decay_end
-    teacher_ema_decay_end = float(os.environ.get("TEACHER_EMA_DECAY_END", 0.999))
+    teacher_ema_decay_end = float(os.environ.get("TEACHER_EMA_DECAY_END", 0.9999))
     jepa_lambda = float(os.environ.get("JEPA_LAMBDA", 0.5))
     sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.02))
     sigreg_projections = int(os.environ.get("SIGREG_PROJECTIONS", 256))
-    mask_ratio = float(os.environ.get("MASK_RATIO", 0.10))
+    mask_ratio = float(os.environ.get("MASK_RATIO", 0.30))
 
 
 # -----------------------------
