@@ -90,10 +90,13 @@ class Hyperparameters:
 
     # Teacher hyperparameters
     teacher_ema_decay = float(
-        os.environ.get("TEACHER_EMA_DECAY", 0.996)
-    )  # DINOv1 default start
-    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.1))
+        os.environ.get("TEACHER_EMA_DECAY", 0.99)
+    )  # start value, scheduled toward ema_decay_end
+    teacher_ema_decay_end = float(os.environ.get("TEACHER_EMA_DECAY_END", 0.999))
+    jepa_lambda = float(os.environ.get("JEPA_LAMBDA", 0.5))
+    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.0))
     sigreg_projections = int(os.environ.get("SIGREG_PROJECTIONS", 256))
+    mask_ratio = float(os.environ.get("MASK_RATIO", 0.10))
 
 
 # -----------------------------
@@ -616,16 +619,22 @@ class Encoder(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        self.mask_token = nn.Parameter(torch.zeros(model_dim))
         self._init_weights()
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        nn.init.normal_(self.mask_token, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, mask: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
+        if mask is not None:
+            x = torch.where(
+                mask.unsqueeze(-1), self.mask_token.to(dtype=x.dtype).expand_as(x), x
+            )
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -889,7 +898,8 @@ def main() -> None:
     ]
     if base_encoder.skip_weights.numel() > 0:
         scalar_params.append(base_encoder.skip_weights)
-    token_lr = args.tied_embed_lr
+    scalar_params.append(base_encoder.mask_token)
+    token_lr = args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [
             {
@@ -916,25 +926,55 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    enc_optimizers: list[torch.optim.Optimizer] = [
+    # LM head setup (trained jointly with encoder from the start)
+    base_lm_head = LMHead(args.model_dim, args.vocab_size, args.logit_softcap).to(
+        device
+    )
+    for module in base_lm_head.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    compiled_lm_head = torch.compile(base_lm_head, dynamic=False, fullgraph=True)
+    lm_head: nn.Module = (
+        DDP(compiled_lm_head, device_ids=[local_rank], broadcast_buffers=False)
+        if distributed
+        else compiled_lm_head
+    )
+
+    optimizer_head = torch.optim.Adam(
+        [
+            {
+                "params": list(base_lm_head.parameters()),
+                "lr": args.head_lr,
+                "base_lr": args.head_lr,
+            }
+        ],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+
+    all_optimizers: list[torch.optim.Optimizer] = [
         optimizer_tok,
+        optimizer_head,
         optimizer_muon,
         optimizer_scalar,
     ]
 
-    n_params = sum(p.numel() for p in base_encoder.parameters())
-    log0(f"encoder_params:{n_params}")
+    n_enc_params = sum(p.numel() for p in base_encoder.parameters())
+    n_head_params = sum(p.numel() for p in base_lm_head.parameters())
+    log0(f"encoder_params:{n_enc_params} lm_head_params:{n_head_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}"
     )
-    log0(f"embed_lr:{token_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
+    log0(f"embed_lr:{token_lr} head_lr:{args.head_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(f"jepa_lambda:{args.jepa_lambda} sigreg_lambda:{args.sigreg_lambda} mask_ratio:{args.mask_ratio}")
     log0(f"seed:{args.seed}")
 
     base_teacher_encoder = (
@@ -962,13 +1002,13 @@ def main() -> None:
     teacher_encoder = torch.compile(base_teacher_encoder, dynamic=False, fullgraph=True)
 
     # -----------------------------
-    # DATA LOADER & ENCODER WARMUP
+    # DATA LOADER & WARMUP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    def zero_grad_enc() -> None:
-        for opt in enc_optimizers:
+    def zero_grad_all() -> None:
+        for opt in all_optimizers:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = (
@@ -1001,15 +1041,23 @@ def main() -> None:
             name: tensor.detach().cpu().clone()
             for name, tensor in base_encoder.state_dict().items()
         }
-        initial_enc_optimizer_states = [
-            copy.deepcopy(opt.state_dict()) for opt in enc_optimizers
+        initial_head_state = {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in base_lm_head.state_dict().items()
+        }
+        initial_optimizer_states = [
+            copy.deepcopy(opt.state_dict()) for opt in all_optimizers
         ]
         encoder.train()
+        lm_head.train()
         for warmup_step in range(args.warmup_steps):
-            zero_grad_enc()
+            zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     encoder.require_backward_grad_sync = (
+                        micro_step == grad_accum_steps - 1
+                    )
+                    lm_head.require_backward_grad_sync = (
                         micro_step == grad_accum_steps - 1
                     )
                 x, y = train_loader.next_batch(
@@ -1018,181 +1066,52 @@ def main() -> None:
                 with torch.autocast(
                     device_type="cuda", dtype=torch.bfloat16, enabled=True
                 ):
-                    student_embeddings = encoder(x)
+                    # LM path: unmasked student
+                    student_unmasked = encoder(x)
+                    logits = lm_head(student_unmasked)
+                    warmup_lm = F.cross_entropy(
+                        logits.float(), y.reshape(-1), reduction="mean"
+                    )
+                    # JEPA path: masked student vs unmasked teacher
+                    mask = torch.rand(x.shape, device=device) < args.mask_ratio
+                    student_masked = encoder(x, mask=mask)
                     with torch.no_grad():
-                        teacher_embeddings = teacher_encoder(y)
-                    warmup_loss = F.mse_loss(student_embeddings, teacher_embeddings)
+                        teacher_unmasked = teacher_encoder(x)
+                    warmup_jepa = F.mse_loss(
+                        student_masked[mask], teacher_unmasked[mask]
+                    )
+                warmup_loss = warmup_lm + args.jepa_lambda * warmup_jepa
                 (warmup_loss * grad_scale).backward()
-            for opt in enc_optimizers:
+            for opt in all_optimizers:
                 opt.step()
-            zero_grad_enc()
+            zero_grad_all()
             if (
                 args.warmup_steps <= 20
                 or (warmup_step + 1) % 10 == 0
                 or warmup_step + 1 == args.warmup_steps
             ):
-                log0(f"encoder_warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+                log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_encoder.load_state_dict(initial_encoder_state, strict=True)
+        base_lm_head.load_state_dict(initial_head_state, strict=True)
         for opt, state in zip(
-            enc_optimizers, initial_enc_optimizer_states, strict=True
+            all_optimizers, initial_optimizer_states, strict=True
         ):
             opt.load_state_dict(state)
-        zero_grad_enc()
+        zero_grad_all()
         if distributed:
             encoder.require_backward_grad_sync = True
+            lm_head.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(
             args.train_files, rank, world_size, device
         )
 
     # -----------------------------
-    # ENCODER TRAINING LOOP
+    # JOINT TRAINING LOOP (CE + JEPA + SigReg)
     # -----------------------------
 
-    log0("--- encoder training ---")
+    log0("--- joint training ---")
     training_time_ms = 0.0
     stop_after_step: int | None = None
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
-    step = 0
-    while True:
-        last_step = step == args.iterations or (
-            stop_after_step is not None and step >= stop_after_step
-        )
-
-        if last_step:
-            torch.cuda.synchronize()
-            training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            if stop_after_step is not None and step < args.iterations:
-                log0(
-                    f"encoder stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
-                )
-            break
-
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        scale = lr_mul(step, elapsed_ms)
-        zero_grad_enc()
-        train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                encoder.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(
-                args.train_batch_tokens, args.train_seq_len, grad_accum_steps
-            )
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                student_embeddings = encoder(x)
-                with torch.no_grad():
-                    teacher_embeddings = teacher_encoder(y)
-                pred_loss = F.mse_loss(student_embeddings, teacher_embeddings)
-            with torch.autocast(device_type="cuda", enabled=False):
-                reg_loss = sigreg_loss(
-                    student_embeddings[:, -1, :].float(),
-                    step,
-                    num_projections=args.sigreg_projections,
-                )
-            loss = (1 - args.sigreg_lambda) * pred_loss + args.sigreg_lambda * reg_loss
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
-
-        frac = (
-            min(step / args.muon_momentum_warmup_steps, 1.0)
-            if args.muon_momentum_warmup_steps > 0
-            else 1.0
-        )
-        muon_momentum = (
-            1 - frac
-        ) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
-
-        for opt in enc_optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
-
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                base_encoder.parameters(), args.grad_clip_norm
-            )
-        for opt in enc_optimizers:
-            opt.step()
-        update_ema(base_encoder, base_teacher_encoder, decay=args.teacher_ema_decay)
-        zero_grad_enc()
-
-        step += 1
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        should_log_train = args.train_log_every > 0 and (
-            step <= 10
-            or step % args.train_log_every == 0
-            or stop_after_step is not None
-        )
-        if should_log_train:
-            log0(
-                f"encoder step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
-            )
-
-        # Needed to sync whether we've reached the wallclock cap.
-        reached_cap = (
-            max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        )
-        if distributed and max_wallclock_ms is not None:
-            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
-            dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
-            reached_cap = bool(reached_cap_tensor.item())
-        if stop_after_step is None and reached_cap:
-            stop_after_step = step
-
-    log0(
-        f"encoder peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
-    )
-
-    # -----------------------------
-    # LM HEAD SETUP + TRAINING LOOP (frozen encoder)
-    # -----------------------------
-
-    log0("--- lm_head training ---")
-    base_encoder.requires_grad_(False)
-    encoder.eval()
-
-    base_lm_head = LMHead(args.model_dim, args.vocab_size, args.logit_softcap).to(
-        device
-    )
-    for module in base_lm_head.modules():
-        if isinstance(module, CastedLinear):
-            module.float()
-    compiled_lm_head = torch.compile(base_lm_head, dynamic=False, fullgraph=True)
-    lm_head: nn.Module = (
-        DDP(compiled_lm_head, device_ids=[local_rank], broadcast_buffers=False)
-        if distributed
-        else compiled_lm_head
-    )
-
-    optimizer_lm_head = torch.optim.Adam(
-        [
-            {
-                "params": list(base_lm_head.parameters()),
-                "lr": args.head_lr,
-                "base_lr": args.head_lr,
-            }
-        ],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    head_optimizers: list[torch.optim.Optimizer] = [optimizer_lm_head]
-    n_head_params = sum(p.numel() for p in base_lm_head.parameters())
-    log0(f"lm_head_params:{n_head_params}")
-
-    def zero_grad_head() -> None:
-        for opt in head_optimizers:
-            opt.zero_grad(set_to_none=True)
-
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    training_time_ms = 0.0
-    stop_after_step = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1222,7 +1141,7 @@ def main() -> None:
                 is_boundary_token_lut,
             )
             log0(
-                f"lm_head step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
@@ -1231,31 +1150,94 @@ def main() -> None:
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 log0(
-                    f"lm_head stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
+                    f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
                     f"step:{step}/{args.iterations}"
                 )
             break
 
-        zero_grad_head()
-        train_loss = torch.zeros((), device=device)
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        scale = lr_mul(step, elapsed_ms)
+        zero_grad_all()
+        train_loss_total = torch.zeros((), device=device)
+        train_lm_loss = torch.zeros((), device=device)
+        train_jepa_loss = torch.zeros((), device=device)
+        train_reg_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
+                encoder.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 lm_head.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                with torch.no_grad():
-                    embeddings = encoder(x)
-                logits = lm_head(embeddings)
-                loss = F.cross_entropy(logits.float(), y.reshape(-1), reduction="mean")
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
 
-        for opt in head_optimizers:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                # 1) LM path: unmasked student -> cross-entropy
+                student_unmasked = encoder(x)
+                logits = lm_head(student_unmasked)
+                lm_loss = F.cross_entropy(
+                    logits.float(), y.reshape(-1), reduction="mean"
+                )
+
+                # 2) JEPA path: masked student vs unmasked EMA teacher
+                mask = torch.rand(x.shape, device=device) < args.mask_ratio
+                student_masked = encoder(x, mask=mask)
+                with torch.no_grad():
+                    teacher_unmasked = teacher_encoder(x)
+                jepa_loss = F.mse_loss(
+                    student_masked[mask], teacher_unmasked[mask]
+                )
+
+            # 3) Optional SigReg on standardized unmasked student embeddings
+            reg_loss = torch.zeros((), device=device)
+            if args.sigreg_lambda > 0:
+                with torch.autocast(device_type="cuda", enabled=False):
+                    z = student_unmasked.reshape(-1, student_unmasked.size(-1)).float()
+                    z = z - z.mean(dim=0, keepdim=True)
+                    z = z / z.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-4)
+                    reg_loss = sigreg_loss(
+                        z, step, num_projections=args.sigreg_projections
+                    )
+
+            loss = lm_loss + args.jepa_lambda * jepa_loss + args.sigreg_lambda * reg_loss
+            train_loss_total += loss.detach()
+            train_lm_loss += lm_loss.detach()
+            train_jepa_loss += jepa_loss.detach()
+            train_reg_loss += reg_loss.detach()
+            (loss * grad_scale).backward()
+        train_loss_total /= grad_accum_steps
+        train_lm_loss /= grad_accum_steps
+        train_jepa_loss /= grad_accum_steps
+        train_reg_loss /= grad_accum_steps
+
+        frac = (
+            min(step / args.muon_momentum_warmup_steps, 1.0)
+            if args.muon_momentum_warmup_steps > 0
+            else 1.0
+        )
+        muon_momentum = (
+            1 - frac
+        ) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        for group in optimizer_muon.param_groups:
+            group["momentum"] = muon_momentum
+
+        for opt in all_optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["base_lr"] * scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                list(base_encoder.parameters()) + list(base_lm_head.parameters()),
+                args.grad_clip_norm,
+            )
+        for opt in all_optimizers:
             opt.step()
-        zero_grad_head()
+        ema_frac = min(step / max(args.iterations, 1), 1.0)
+        ema_decay = (
+            args.teacher_ema_decay
+            + (args.teacher_ema_decay_end - args.teacher_ema_decay) * ema_frac
+        )
+        update_ema(base_encoder, base_teacher_encoder, decay=ema_decay)
+        zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1265,11 +1247,27 @@ def main() -> None:
             or stop_after_step is not None
         )
         if should_log_train:
+            with torch.no_grad():
+                emb_std = student_unmasked.float().std(dim=0).mean().item()
+                emb_flat = student_unmasked.float().reshape(
+                    -1, student_unmasked.size(-1)
+                )
+                emb_norms = F.normalize(emb_flat, dim=-1)
+                cos_sim = (
+                    (emb_norms[:256] @ emb_norms[:256].T)
+                    .fill_diagonal_(0)
+                    .mean()
+                    .item()
+                )
             log0(
-                f"lm_head step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} loss:{train_loss_total.item():.4f} "
+                f"lm:{train_lm_loss.item():.4f} jepa:{train_jepa_loss.item():.4f} "
+                f"reg:{train_reg_loss.item():.4f} "
+                f"emb_std:{emb_std:.4f} cos_sim:{cos_sim:.4f} ema:{ema_decay:.5f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
+        # Needed to sync whether we've reached the wallclock cap.
         reached_cap = (
             max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         )
@@ -1281,7 +1279,7 @@ def main() -> None:
             stop_after_step = step
 
     log0(
-        f"lm_head peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+        f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
