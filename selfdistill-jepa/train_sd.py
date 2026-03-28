@@ -94,7 +94,7 @@ class Hyperparameters:
     )  # start value, scheduled toward ema_decay_end
     teacher_ema_decay_end = float(os.environ.get("TEACHER_EMA_DECAY_END", 0.999))
     jepa_lambda = float(os.environ.get("JEPA_LAMBDA", 0.5))
-    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.0))
+    sigreg_lambda = float(os.environ.get("SIGREG_LAMBDA", 0.02))
     sigreg_projections = int(os.environ.get("SIGREG_PROJECTIONS", 256))
     mask_ratio = float(os.environ.get("MASK_RATIO", 0.10))
 
@@ -968,13 +968,17 @@ def main() -> None:
     log0(
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}"
     )
-    log0(f"embed_lr:{token_lr} head_lr:{args.head_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}")
+    log0(
+        f"embed_lr:{token_lr} head_lr:{args.head_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+    )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"jepa_lambda:{args.jepa_lambda} sigreg_lambda:{args.sigreg_lambda} mask_ratio:{args.mask_ratio}")
+    log0(
+        f"jepa_lambda:{args.jepa_lambda} sigreg_lambda:{args.sigreg_lambda} mask_ratio:{args.mask_ratio}"
+    )
     log0(f"seed:{args.seed}")
 
     base_teacher_encoder = (
@@ -1093,9 +1097,7 @@ def main() -> None:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_encoder.load_state_dict(initial_encoder_state, strict=True)
         base_lm_head.load_state_dict(initial_head_state, strict=True)
-        for opt, state in zip(
-            all_optimizers, initial_optimizer_states, strict=True
-        ):
+        for opt, state in zip(all_optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
         if distributed:
@@ -1183,9 +1185,7 @@ def main() -> None:
                 student_masked = encoder(x, mask=mask)
                 with torch.no_grad():
                     teacher_unmasked = teacher_encoder(x)
-                jepa_loss = F.mse_loss(
-                    student_masked[mask], teacher_unmasked[mask]
-                )
+                jepa_loss = F.mse_loss(student_masked[mask], teacher_unmasked[mask])
 
             # 3) Optional SigReg on standardized unmasked student embeddings
             reg_loss = torch.zeros((), device=device)
@@ -1198,7 +1198,9 @@ def main() -> None:
                         z, step, num_projections=args.sigreg_projections
                     )
 
-            loss = lm_loss + args.jepa_lambda * jepa_loss + args.sigreg_lambda * reg_loss
+            loss = (
+                lm_loss + args.jepa_lambda * jepa_loss + args.sigreg_lambda * reg_loss
+            )
             train_loss_total += loss.detach()
             train_lm_loss += lm_loss.detach()
             train_jepa_loss += jepa_loss.detach()
