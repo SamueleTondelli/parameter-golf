@@ -1,0 +1,21 @@
+NVFP4 Experiment Results
+========================
+
+--- Experiment 1: Baseline (bf16) ---
+============================================================
+Experiment: Baseline (bf16)
+Final Train Loss: 3.236621
+Final Val Loss: 3.262447
+Final Val BPB: 1.932205
+Final Artifact Size: 7656466 bytes (7.30 MB)
+============================================================
+
+--- Experiment 3: PTQ NVFP4 ---
+============================================================
+Experiment: PTQ NVFP4 (train bf16, quantize)
+Final Train Loss: 3.236545
+Final Val Loss: 3.262140
+Final Val BPB: 1.932023
+Final Artifact Size: 16032341 bytes (15.29 MB)
+============================================================
+
