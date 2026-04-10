@@ -29,6 +29,7 @@ image = (
         "datasets",
         "tiktoken",
         "sentencepiece",
+        "packaging",
     )
     # Copy the full repo into the image so train_gpt.py and data scripts are available.
     .add_local_dir(
@@ -92,6 +93,7 @@ FORWARDED_ENVS = [
     "TRAIN_LOG_EVERY",
     "QK_GAIN_INIT",
     "GRAD_CLIP_NORM",
+    "MLP_MULTS",
 ]
 
 
