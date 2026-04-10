@@ -61,12 +61,28 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
-    mlp_mults = [
-        float(x)
-        for x in os.environ.get(
-            "MLP_MULTS", "3.5,3.25,3,2.75,2.5,2.5,2.5,2.75,3,3.25,3.5"
-        ).split(",")
-    ]
+    mlp_squeeze_valley = float(os.environ.get("MLP_SQUEEZE_VALLEY", "2.5"))
+    mlp_mults_env = os.environ.get("MLP_MULTS", "")
+
+    if mlp_mults_env:
+        mlp_mults = [float(x) for x in mlp_mults_env.split(",")]
+    else:
+        if num_layers % 2 == 1:
+            half = (num_layers - 1) // 2
+            max_dist = half
+        else:
+            half = num_layers // 2
+            max_dist = half - 0.5
+
+        mlp_mults = []
+        for i in range(num_layers):
+            if num_layers % 2 == 1:
+                dist = abs(i - half)
+            else:
+                dist = abs(i - (half - 0.5))
+            value = mlp_squeeze_valley + (3.0 - mlp_squeeze_valley) * (dist / max_dist)
+            mlp_mults.append(round(value, 2))
+
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))

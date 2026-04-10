@@ -94,6 +94,7 @@ FORWARDED_ENVS = [
     "QK_GAIN_INIT",
     "GRAD_CLIP_NORM",
     "MLP_MULTS",
+    "MLP_SQUEEZE_VALLEY",
 ]
 
 
