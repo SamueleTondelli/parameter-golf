@@ -2792,6 +2792,9 @@ def main() -> None:
     log0(
         f"final_int6_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}"
     )
+    # Use roundtrip (post-quantization) values as the final submission metrics
+    final_val_loss = q_val_loss
+    final_val_bpb = q_val_bpb
     sw_seq_len = effective_eval_seq_len
     if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
